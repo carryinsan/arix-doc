@@ -210,53 +210,90 @@ async function processPdf(file, options, signal, progress) {
   const pdfjs = await loadPdfJs();
   const data = new Uint8Array(await file.arrayBuffer());
   checkAbort(signal);
+
+  // Keep the loading task as the authoritative PDF.js lifecycle handle.
+  // Its destroy() method terminates the worker and is available even when
+  // document parsing/rendering fails part-way through the file.
   const loading = pdfjs.getDocument({ data, isEvalSupported: false, useSystemFonts: true });
-  const pdf = await loading.promise;
-  const pages = [];
-  let nativePages = 0;
-  let ocrPages = 0;
-  const total = pdf.numPages;
-  for (let pageNo = 1; pageNo <= total; pageNo += 1) {
-    checkAbort(signal);
-    const page = await pdf.getPage(pageNo);
-    const textContent = await page.getTextContent({ includeMarkedContent: false });
-    const extracted = meaningfulPdfText(textContent.items || []);
-    let blocks = [];
-    let source = 'native';
-    let engineName = null;
-    let imageSize = null;
-    if (extracted.meaningful) {
-      blocks = (textContent.items || []).filter((item) => item.str?.trim()).map((item) => ({
-        type: 'text', text: item.str, bbox: {
-          x: Number(item.transform?.[4] || 0), y: Number(item.transform?.[5] || 0),
-          width: Number(item.width || 0), height: Number(item.height || 0)
-        }, confidence: null, source: 'native'
-      }));
-      nativePages += 1;
-    } else {
-      source = 'ocr';
-      const viewport = page.getViewport({ scale: Math.min(2.2, 3000 / Math.max(page.view[2] - page.view[0], page.view[3] - page.view[1])) });
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.max(1, Math.ceil(viewport.width));
-      canvas.height = Math.max(1, Math.ceil(viewport.height));
-      const context = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
-      context.fillStyle = '#fff'; context.fillRect(0, 0, canvas.width, canvas.height);
-      await page.render({ canvasContext: context, viewport }).promise;
-      const prepared = enhanceCanvas(canvas, options.enhance !== false);
-      imageSize = { width: prepared.width, height: prepared.height };
-      const recognized = await recognizeCanvas(prepared, options, signal, progress);
-      blocks = recognized.blocks;
-      engineName = recognized.engine;
-      ocrPages += 1;
-      canvas.width = 1; canvas.height = 1;
+  let pdf;
+  try {
+    pdf = await loading.promise;
+    const pages = [];
+    let nativePages = 0;
+    let ocrPages = 0;
+    const total = pdf.numPages;
+
+    for (let pageNo = 1; pageNo <= total; pageNo += 1) {
+      checkAbort(signal);
+      const page = await pdf.getPage(pageNo);
+      try {
+        const textContent = await page.getTextContent({ includeMarkedContent: false });
+        const extracted = meaningfulPdfText(textContent.items || []);
+        let blocks = [];
+        let source = 'native';
+        let engineName = null;
+        let imageSize = null;
+
+        if (extracted.meaningful) {
+          blocks = (textContent.items || []).filter((item) => item.str?.trim()).map((item) => ({
+            type: 'text', text: item.str, bbox: {
+              x: Number(item.transform?.[4] || 0), y: Number(item.transform?.[5] || 0),
+              width: Number(item.width || 0), height: Number(item.height || 0)
+            }, confidence: null, source: 'native'
+          }));
+          nativePages += 1;
+        } else {
+          source = 'ocr';
+          const viewport = page.getViewport({ scale: Math.min(2.2, 3000 / Math.max(page.view[2] - page.view[0], page.view[3] - page.view[1])) });
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.ceil(viewport.width));
+          canvas.height = Math.max(1, Math.ceil(viewport.height));
+          const context = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
+          if (!context) throw new Error(`Could not allocate a rendering surface for PDF page ${pageNo}.`);
+          context.fillStyle = '#fff';
+          context.fillRect(0, 0, canvas.width, canvas.height);
+          await page.render({ canvasContext: context, viewport }).promise;
+          const prepared = enhanceCanvas(canvas, options.enhance !== false);
+          imageSize = { width: prepared.width, height: prepared.height };
+          const recognized = await recognizeCanvas(prepared, options, signal, progress);
+          blocks = recognized.blocks;
+          engineName = recognized.engine;
+          ocrPages += 1;
+          // Release the potentially large page bitmap as soon as OCR finishes.
+          canvas.width = 1;
+          canvas.height = 1;
+        }
+
+        const text = blocks.map((b) => b.text).join('\n').trim();
+        pages.push({
+          page: pageNo, text, blocks, source, engine: engineName, imageSize,
+          rotation: Number(page.rotate || 0),
+          pageSize: { width: page.view[2] - page.view[0], height: page.view[3] - page.view[1] }
+        });
+        emit(progress, { phase: 'pages', page: pageNo, total, nativePages, ocrPages, percent: Math.round(pageNo / total * 100) });
+      } finally {
+        // A page may fail during extraction/render/OCR; still release its cache.
+        try { page.cleanup(); } catch { /* Best-effort page memory cleanup. */ }
+      }
     }
-    const text = blocks.map((b) => b.text).join('\n').trim();
-    pages.push({ page: pageNo, text, blocks, source, engine: engineName, imageSize, rotation: Number(page.rotate || 0), pageSize: { width: page.view[2] - page.view[0], height: page.view[3] - page.view[1] } });
-    emit(progress, { phase: 'pages', page: pageNo, total, nativePages, ocrPages, percent: Math.round(pageNo / total * 100) });
-    page.cleanup();
+
+    return {
+      pages,
+      metadata: {
+        format: 'PDF', pageCount: total, nativePages, ocrPages,
+        method: ocrPages ? 'hybrid-local' : 'native-local'
+      }
+    };
+  } finally {
+    // PDFDocumentLoadingTask.destroy() is the documented worker teardown API.
+    // Do not call a misspelled/non-existent `pdf.destory` property.
+    if (loading && typeof loading.destroy === 'function') {
+      try { await loading.destroy(); } catch { /* Preserve the original processing error. */ }
+    } else if (pdf && typeof pdf.destroy === 'function') {
+      // Compatibility fallback for alternate PDF.js builds.
+      try { await pdf.destroy(); } catch { /* Preserve the original processing error. */ }
+    }
   }
-  await pdf.destroy();
-  return { pages, metadata: { format: 'PDF', pageCount: total, nativePages, ocrPages, method: ocrPages ? 'hybrid-local' : 'native-local' } };
 }
 
 function parseXml(xml, label) {
